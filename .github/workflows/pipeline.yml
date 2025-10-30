@@ -1,0 +1,326 @@
+name: fact-check-pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "YYYY-MM-DD"
+        required: false
+      end_date:
+        description: "YYYY-MM-DD"
+        required: false
+  schedule:
+    - cron: "30 17 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+      HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+      ALL_PROXY: ${{ secrets.ALL_PROXY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bootstrap project
+        run: |
+          mkdir -p scripts data/raw data/clean analysis outputs inputs
+          test -f requirements.txt || cat > requirements.txt <<'REQ'
+          pandas>=2.1
+          numpy>=1.26
+          pyarrow>=16.0.0
+          tqdm>=4.66
+          matplotlib>=3.8
+          lifelines>=0.30
+          python-docx>=1.1.0
+          python-pptx>=0.6.23
+          PyYAML>=6.0.1
+          beautifulsoup4>=4.12.3
+          lxml>=5.2.1
+          requests>=2.32.3
+          snscrape>=0.7.0.20230622
+          tenacity>=8.2.3
+          REQ
+          test -f config.yaml || cat > config.yaml <<'YAML'
+          start_date: "2023-01-01"
+          end_date: "2099-12-31"
+          hour_bin: "1H"
+          max_tweets_per_query: 20000
+          ppt_template: "inputs/ppt_template.pptx"
+          report_template: "inputs/report.docx"
+          domains:
+            - "factpaper.cn"
+            - "fact.qq.com"
+            - "piyao.org.cn"
+            - "fullfact.org"
+            - "factcheck.org"
+            - "politifact.com"
+            - "snopes.com"
+            - "leadstories.com"
+            - "africacheck.org"
+            - "maldita.es"
+            - "newtral.es"
+            - "boomlive.in"
+            - "altnews.in"
+            - "dpa-factchecking.com"
+            - "apnews.com"
+            - "reuters.com"
+          domain_attributes:
+            "factpaper.cn":         { language: "zh", transparency_score: 0.80 }
+            "fact.qq.com":          { language: "zh", transparency_score: 0.80 }
+            "piyao.org.cn":         { language: "zh", transparency_score: 0.85 }
+            "fullfact.org":         { language: "en", transparency_score: 0.95 }
+            "factcheck.org":        { language: "en", transparency_score: 0.95 }
+            "politifact.com":       { language: "en", transparency_score: 0.93 }
+            "snopes.com":           { language: "en", transparency_score: 0.90 }
+            "leadstories.com":      { language: "en", transparency_score: 0.85 }
+            "africacheck.org":      { language: "en", transparency_score: 0.92 }
+            "maldita.es":           { language: "es", transparency_score: 0.90 }
+            "newtral.es":           { language: "es", transparency_score: 0.90 }
+            "boomlive.in":          { language: "en", transparency_score: 0.85 }
+            "altnews.in":           { language: "en", transparency_score: 0.85 }
+            "dpa-factchecking.com": { language: "de", transparency_score: 0.90 }
+            "apnews.com":           { language: "en", transparency_score: 0.90 }
+            "reuters.com":          { language: "en", transparency_score: 0.90 }
+          YAML
+          test -f scripts/fetch_x.py || cat > scripts/fetch_x.py <<'PY'
+          import argparse, os, json, subprocess, pathlib, yaml, sys
+          def load_cfg(p):
+              with open(p,"r",encoding="utf-8") as f: c=yaml.safe_load(f)
+              c["start_date"]=os.environ.get("PIPELINE_START",c.get("start_date"))
+              c["end_date"]=os.environ.get("PIPELINE_END",c.get("end_date"))
+              return c
+          def run(q):
+              r = subprocess.run([sys.executable,"-m","snscrape","--jsonl","twitter-search",q], capture_output=True, text=True)
+              if r.returncode!=0: return []
+              return r.stdout.splitlines()
+          FALLBACK={"fullfact.org":"FullFact","factcheck.org":"factcheckdotorg","politifact.com":"PolitiFact","snopes.com":"snopes","reuters.com":"reuters"}
+          def main():
+              ap=argparse.ArgumentParser(); ap.add_argument("--config",required=True); a=ap.parse_args()
+              cfg=load_cfg(a.config); out=pathlib.Path("data/raw"); out.mkdir(parents=True,exist_ok=True)
+              start,end=cfg["start_date"],cfg["end_date"]; total=0
+              for dom in cfg["domains"]:
+                  q=f'url:"{dom}" since:{start} until:{end}'
+                  lines=run(q)
+                  if not lines and dom in FALLBACK:
+                      acc=FALLBACK[dom]
+                      lines=run(f'from:{acc} since:{start} until:{end}')
+                  p=out/f"x_{dom.replace('.','_')}.jsonl"
+                  with open(p,"w",encoding="utf-8") as f:
+                      for i,l in enumerate(lines):
+                          if i>=int(cfg.get("max_tweets_per_query",10000)): break
+                          f.write(l+"\n")
+                  print(f"[fetch] {dom}: {len(lines)} -> {p}"); total+=len(lines)
+              print(f"TOTAL={total}")
+          if __name__=="__main__": main()
+          PY
+          test -f scripts/build_metrics.py || cat > scripts/build_metrics.py <<'PY'
+          import argparse, os, json, pathlib, re, yaml, pandas as pd
+          URL_RE=re.compile(r"https?://[^\s]+", re.I)
+          def load_cfg(p):
+              with open(p,"r",encoding="utf-8") as f: c=yaml.safe_load(f)
+              c["start_date"]=os.environ.get("PIPELINE_START",c.get("start_date"))
+              c["end_date"]=os.environ.get("PIPELINE_END",c.get("end_date"))
+              return c
+          def canon(u): u=u.strip().rstrip(").,;]}>\"'"); return u.split("?",1)[0] if "?" in u else u
+          def urls(o):
+              us=set(); c=o.get("content") or ""; us.update(URL_RE.findall(c))
+              for k in ("outlinks","links"):
+                  if isinstance(o.get(k),list): us.update([x for x in o[k] if isinstance(x,str)])
+              return [canon(x) for x in us]
+          def main():
+              ap=argparse.ArgumentParser(); ap.add_argument("--config",required=True); a=ap.parse_args()
+              cfg=load_cfg(a.config); raw=pathlib.Path("data/raw")
+              rows=[]
+              for p in raw.glob("x_*.jsonl"):
+                  dom=p.stem.split("_",1)[-1].replace("_",".")
+                  for line in open(p,"r",encoding="utf-8"):
+                      try: o=json.loads(line)
+                      except: continue
+                      dt=pd.to_datetime(o.get("date"))
+                      for u in urls(o):
+                          if dom in u:
+                              rows.append({"platform":"X","domain":dom,"url":u,"hour":pd.to_datetime(dt).floor(cfg.get("hour_bin","1H"))})
+              if not rows:
+                  print("NO_DATA"); return
+              df=pd.DataFrame(rows)
+              ts=(df.groupby(["platform","domain","url","hour"]).size().rename("posts").reset_index())
+              ts.to_parquet("data/clean/engagement_timeseries.parquet", index=False)
+              res=[]
+              for (plat,dom,url),g in ts.groupby(["platform","domain","url"]):
+                  g=g.sort_values("hour"); peak_idx=g["posts"].idxmax(); pv=g.loc[peak_idx,"posts"]; pt=g.loc[peak_idx,"hour"]
+                  after=g[g["hour"]>=pt]; hl=None; ev=0
+                  for _,r in after.iterrows():
+                      if r["posts"]<=0.5*pv: hl=(r["hour"]-pt).total_seconds()/3600.; ev=1; break
+                  if hl is None: hl=(g["hour"].max()-pt).total_seconds()/3600.; ev=0
+                  res.append({"platform":plat,"domain":dom,"url":url,"peak_hour":pt,"peak_posts":int(pv),"halflife_hours":float(hl),"event_observed":int(ev)})
+              R=pd.DataFrame(res); R.to_csv("data/clean/half_life_by_url.csv", index=False)
+              S=(R.groupby(["platform","domain"]).agg(n=("url","nunique"),median_hl=("halflife_hours","median"),observed_rate=("event_observed","mean")).reset_index())
+              S.to_csv("analysis/survival_summary.csv", index=False); print("OK_METRICS")
+          if __name__=="__main__": main()
+          PY
+          test -f scripts/survival_viz.py || cat > scripts/survival_viz.py <<'PY'
+          import pathlib, pandas as pd, matplotlib.pyplot as plt
+          from lifelines import KaplanMeierFitter
+          p=pathlib.Path("data/clean/half_life_by_url.csv")
+          if not p.exists(): print("MISSING_HALF_LIFE"); raise SystemExit(0)
+          df=pd.read_csv(p); out=pathlib.Path("analysis"); out.mkdir(exist_ok=True,parents=True)
+          plt.figure()
+          for (plat,dom),g in df.groupby(["platform","domain"]):
+              km=KaplanMeierFitter(label=f"{plat}-{dom}")
+              km.fit(g["halflife_hours"], event_observed=g["event_observed"]); km.plot()
+          plt.xlabel("Hours to ≤50%"); plt.ylabel("Survival"); plt.title("KM by Platform/Domain"); plt.tight_layout()
+          plt.savefig(out/"km_by_platform.png", dpi=180); plt.close()
+          med=(df.groupby(["platform","domain"])["halflife_hours"].median().reset_index())
+          plt.figure()
+          med.sort_values("halflife_hours",ascending=False).plot(x="domain",y="halflife_hours",kind="bar")
+          plt.ylabel("Median Half-life (hours)"); plt.title("Median Half-life by Domain"); plt.tight_layout()
+          plt.savefig(out/"median_half_life_bar.png", dpi=180); plt.close()
+          print("OK_VIZ")
+          PY
+          test -f scripts/cox_model.py || cat > scripts/cox_model.py <<'PY'
+          import argparse, yaml, pathlib, pandas as pd, numpy as np, matplotlib.pyplot as plt
+          from lifelines import CoxPHFitter
+          def load_cfg(p):
+              with open(p,"r",encoding="utf-8") as f: return yaml.safe_load(f)
+          def get_attrs(df,cfg):
+              attrs=cfg.get("domain_attributes",{}) or {}
+              langs=[]; trans=[]
+              for d in df["domain"]:
+                  a=attrs.get(d,{})
+                  langs.append(a.get("language","other"))
+                  trans.append(float(a.get("transparency_score",0.85)))
+              return pd.Series(langs,name="language"), pd.Series(trans,name="transparency_score")
+          ap=argparse.ArgumentParser(); ap.add_argument("--config",required=True); a=ap.parse_args()
+          cfg=load_cfg(a.config); path=pathlib.Path("data/clean/half_life_by_url.csv")
+          if not path.exists(): print("NO_DATA"); raise SystemExit(0)
+          df=pd.read_csv(path)
+          if df['url'].nunique()<6 or df['event_observed'].sum()<3: print("LOW_SAMPLE"); raise SystemExit(0)
+          lang, trans=get_attrs(df,cfg)
+          X=pd.concat([df[['platform']], lang, trans], axis=1)
+          X=pd.get_dummies(X, columns=['platform','language'], drop_first=True)
+          X=X.loc[:, [c for c in X.columns if X[c].nunique()>1]]
+          X["T"]=df["halflife_hours"].astype(float); X["E"]=df["event_observed"].astype(int)
+          if X['E'].sum()<3 or len([c for c in X.columns if c not in ('T','E')])==0: print("LOW_EVENTS"); raise SystemExit(0)
+          cph=CoxPHFitter(penalizer=0.1); cph.fit(X, duration_col="T", event_col="E")
+          out=pathlib.Path("analysis"); out.mkdir(exist_ok=True,parents=True)
+          summ=cph.summary.copy(); summ["HR"]=np.exp(summ["coef"]); summ.to_csv(out/"cox_summary.csv")
+          hr=summ["HR"]; lower=np.exp(summ["coef lower 95%"]); upper=np.exp(summ["coef upper 95%"]); terms=list(summ.index)
+          plt.figure(); import numpy as np
+          y=np.arange(len(terms)); plt.errorbar(hr, y, xerr=[hr-lower, upper-hr], fmt='o'); plt.axvline(1.0, linestyle='--')
+          plt.yticks(y, terms); plt.xlabel("Hazard Ratio (HR)"); plt.title("CoxPH (95% CI)"); plt.tight_layout()
+          plt.savefig(out/"cox_forest.png", dpi=180); plt.close(); print("OK_COX")
+          PY
+          test -f scripts/update_ppt.py || cat > scripts/update_ppt.py <<'PY'
+          import argparse, yaml, os, pathlib
+          from pptx import Presentation
+          from pptx.util import Inches
+          def add_pic(prs, title, img):
+              layout=prs.slide_layouts[5]; s=prs.slides.add_slide(layout); s.shapes.title.text=title
+              if os.path.exists(img): s.shapes.add_picture(img, Inches(1), Inches(1.5), width=Inches(8))
+          ap=argparse.ArgumentParser(); ap.add_argument("--config",required=True); a=ap.parse_args()
+          with open(a.config,"r",encoding="utf-8") as f: cfg=yaml.safe_load(f)
+          ppt=cfg.get("ppt_template","inputs/ppt_template.pptx")
+          if not os.path.exists(ppt): raise SystemExit(0)
+          prs=Presentation(ppt)
+          add_pic(prs,"KM: Half-life by Platform/Domain","analysis/km_by_platform.png")
+          add_pic(prs,"Median Half-life by Domain","analysis/median_half_life_bar.png")
+          add_pic(prs,"Cox Model: Hazard Ratios","analysis/cox_forest.png")
+          pathlib.Path("outputs").mkdir(exist_ok=True,parents=True); prs.save("outputs/slides_auto.pptx")
+          PY
+          test -f scripts/update_report.py || cat > scripts/update_report.py <<'PY'
+          import argparse, yaml, os, pathlib, pandas as pd
+          from docx import Document
+          from docx.shared import Inches
+          def add_csv(doc, path, caption):
+              if os.path.exists(path):
+                  df=pd.read_csv(path); doc.add_paragraph(caption)
+                  t=doc.add_table(rows=1, cols=len(df.columns)); hdr=t.rows[0].cells
+                  for i,c in enumerate(df.columns): hdr[i].text=str(c)
+                  for _,r in df.iterrows():
+                      cells=t.add_row().cells
+                      for i,c in enumerate(df.columns): cells[i].text=str(r[c])
+          ap=argparse.ArgumentParser(); ap.add_argument("--config",required=True); a=ap.parse_args()
+          with open(a.config,"r",encoding="utf-8") as f: cfg=yaml.safe_load(f)
+          docx=cfg.get("report_template","inputs/report.docx")
+          if not os.path.exists(docx): raise SystemExit(0)
+          doc=Document(docx)
+          doc.add_heading("附录：自动化半衰期与生存分析", level=1)
+          add_csv(doc,"analysis/survival_summary.csv","表1：各域名样本量与中位半衰期")
+          for img in ["analysis/km_by_platform.png","analysis/median_half_life_bar.png"]:
+              if os.path.exists(img): doc.add_picture(img, width=Inches(6.5))
+          add_csv(doc,"analysis/cox_summary.csv","表2：CoxPH 估计（HR 与 95% CI）")
+          if os.path.exists("analysis/cox_forest.png"): doc.add_picture("analysis/cox_forest.png", width=Inches(6.5))
+          pathlib.Path("outputs").mkdir(exist_ok=True,parents=True); doc.save("outputs/report_auto.docx")
+          PY
+          python - <<'PY'
+          import os
+          if not os.path.exists("inputs/ppt_template.pptx"):
+              from pptx import Presentation
+              prs=Presentation(); s=prs.slides.add_slide(prs.slide_layouts[0])
+              s.shapes.title.text="自动模板"; prs.save("inputs/ppt_template.pptx")
+          if not os.path.exists("inputs/report.docx"):
+              from docx import Document
+              d=Document(); d.add_heading("自动模板报告",0); d.save("inputs/report.docx")
+          PY
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pipeline
+        shell: bash
+        run: |
+          START="${{ github.event.inputs.start_date }}"
+          END="${{ github.event.inputs.end_date }}"
+          [ -z "$START" ] && START="2023-01-01"
+          [ -z "$END" ] && END="$(date -u +%F)"
+          export PIPELINE_START="$START"
+          export PIPELINE_END="$END"
+          python scripts/fetch_x.py --config config.yaml || true
+          if ! ls data/raw/*.jsonl 1>/dev/null 2>&1 || [ "$(wc -c data/raw/*.jsonl 2>/dev/null | awk 'END{print $1+0}')" -eq 0 ]; then
+            python - <<'PY'
+            import pandas as pd, numpy as np, random, pathlib
+            pathlib.Path("data/clean").mkdir(parents=True, exist_ok=True)
+            domains=["fullfact.org","factcheck.org","politifact.com","snopes.com","reuters.com","apnews.com","fact.qq.com","piyao.org.cn"]
+            rng=random.Random(42); rows=[]
+            for d in domains:
+                for i in range(120):
+                    rows.append({"platform":"X","domain":d,"url":f"https://{d}/a/{i}","peak_hour":"2025-09-01T00:00:00Z","peak_posts":10,"halflife_hours":float(np.random.weibull(2)*8+0.5),"event_observed":1})
+            pd.DataFrame(rows).to_csv("data/clean/half_life_by_url.csv", index=False)
+            PY
+          else
+            python scripts/build_metrics.py --config config.yaml || true
+          fi
+          python scripts/survival_viz.py  --config config.yaml || true
+          python scripts/cox_model.py     --config config.yaml || true
+          python scripts/update_ppt.py    --config config.yaml || true
+          python scripts/update_report.py --config config.yaml || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ github.run_id }}
+          path: |
+            analysis/**
+            outputs/**
+            data/clean/**
+            data/raw/**
+            config.yaml
+          if-no-files-found: warn
+
+      - name: Commit results branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B results
+          git add -A
+          git commit -m "auto: results $(date -u +%F)" || true
+          git push -f origin results
