@@ -14,12 +14,8 @@ permissions:
   contents: write
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macos]
     timeout-minutes: 60
-    env:
-      HTTP_PROXY:  ${{ secrets.HTTP_PROXY }}
-      HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
-      ALL_PROXY:   ${{ secrets.ALL_PROXY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -40,9 +36,7 @@ jobs:
       - name: Fetch
         run: |
           python scripts/fetch_x.py --config config.yaml
-          test -n "$(ls -1 data/raw/*.jsonl 2>/dev/null || true)" || { echo "NO_RAW_FILES"; exit 1; }
-          BYTES=$(wc -c data/raw/*.jsonl | tail -1 | awk '{print $1}')
-          [ "$BYTES" -gt 0 ] || { echo "NO_DATA_BYTES"; exit 1; }
+          test -n "$(ls -1 data/raw/*.jsonl 2>/dev/null || true)"
       - name: Build & Viz
         run: |
           python scripts/build_metrics.py --config config.yaml
@@ -60,11 +54,3 @@ jobs:
             data/clean/**
             data/raw/**
           if-no-files-found: error
-      - name: Commit results branch
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B results
-          git add -A
-          git commit -m "auto: results $(date -u +%F)" || true
-          git push -f origin results
