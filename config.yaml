@@ -1,0 +1,19 @@
+start_date: "2024-09-01"
+end_date: "2025-10-01"
+hour_bin: "1H"
+max_tweets_per_query: 8000
+ppt_template: "inputs/ppt_template.pptx"
+report_template: "inputs/report.docx"
+focus_mingcha: true
+
+domains:
+  - "thepaper.cn"
+  - "fact.qq.com"
+  - "fullfact.org"
+  - "reuters.com"
+
+domain_attributes:
+  "thepaper.cn":  { language: "zh", transparency_score: 0.88 }
+  "fact.qq.com":  { language: "zh", transparency_score: 0.80 }
+  "fullfact.org": { language: "en", transparency_score: 0.95 }
+  "reuters.com":  { language: "en", transparency_score: 0.90 }
