@@ -1,0 +1,9 @@
+pandas
+numpy
+matplotlib
+lifelines
+python-pptx
+pyyaml
+requests[socks]
+pyarrow
+snscrape
